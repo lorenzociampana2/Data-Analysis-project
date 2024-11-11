@@ -1,0 +1,1211 @@
+---
+title: 'Final Project: a look into Brazilian Houses rents'
+output:
+  html_document: default
+  geomwtry: margin:=1in
+  pdf_document: 
+date: "`r Sys.Date()`"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+```
+
+#### *Matteo Carucci, Alessandro Natoli, Tommaso Agudio and Lorenzo Ciampana.*
+
+## 1. Understanding the dataset
+
+In the first part of the project we will investigate some interesting
+trends and insights on the house rent market in Brazil. Let's get a
+broad idea of what the dataset looks like, checking any irregularities
+in the data.
+
+\***Important Disclaimer: We understand the importance of providing
+clear and smart code, however we prioritized the importance of our
+findings. To check all our elaborations and techniques tried, please
+refer to the complete Rscript code - Some important chunks have been
+omitted from this report due to their size.**
+
+```{r, echo = FALSE}
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(corrplot)
+library(GGally)
+library(gridExtra)
+library(glmnet)
+library(MASS)
+library(caret)
+library(randomForest)
+library(mgcv)
+library(purrr)
+library(cowplot)
+library(tidyverse)
+library(factoextra)
+library(cluster)
+library(patchwork)
+
+
+```
+
+#### 1.1 Data cleaning, getting rid of nulls.
+
+We now start with data preparation. Some duplicates were found and nulls
+in the **`floor`** column.
+
+```{r, echo = FALSE}
+#importing the data! (CHANGE THE DIRECTORY)
+data <- read.csv("C:/BrazHousesRent.csv")
+
+# Head and structure of the dataset
+#head(data)
+#str(data)
+```
+
+```{r, include = FALSE}
+#the floor is a character but should be a number, let's convert it!
+data$floor <- as.numeric(data$floor)
+
+#missing values?
+sapply(data, function(x) sum(is.na(x)))  #no null in df except floors!
+sapply(data, function(x) sum(x == 0))   #there are many values == 0!, still makes sense, some houses may not have parking spaces and taxes
+
+
+#duplicated(data)  #some duplicates in the df
+data <- data[!duplicated(data),]  #dataframe with no duplicates
+
+
+```
+
+#### 1.2 What about missing floor data?
+
+Looking at the cells above, We could either use mean or median
+imputation for replacing the nulls in the floor column. Anyways, the
+MICE package offers a set of very powerful methods to impute and
+estimate the missing values, so we will use it! In particular we used
+PMM Mice method which stands for predictive mean matching, a regression
+model which uses the other variables as predictors; trivially, it uses
+rows having similar predictors of the missing value row, and impute the
+missing value of the row by using the "similar" values as predictors.
+
+```{r,include = FALSE}
+#How do we treat nulls? We could either use Median or mean imputation but MICE usually works very well!
+library(mice)
+data_imputed <- data
+
+
+# Create the imputation object. We will use a simple pmm.
+set.seed(123)
+imp <- mice(data_imputed, method = "pmm")
+imputed <- complete(imp)[,"floor"]
+
+# replaced imputed data with previous (nonetheless floor should matter nothing to the regression!)
+data_imputed$floor[is.na(data_imputed$floor)] <- imputed[is.na(data_imputed$floor)]  #replacing the new imputed with previous
+
+
+#let us factor the other categorical columns before starting
+data_imputed$city <- as.factor(data_imputed$city)
+data_imputed$animal <- as.factor(data_imputed$animal)
+data_imputed$furniture <- as.factor(data_imputed$furniture)
+
+
+#rename columns with better names
+data_imputed <- data_imputed %>%
+  rename(hoa = hoa..R.., rent = rent.amount..R.., proptax = property.tax..R..
+, fireins = fire.insurance..R..)
+
+```
+
+\nopagebreak
+
+***A summary of the new cleaned data.***
+
+```{r, echo = FALSE, fig.width=2, fig.height=2, dev.args=list(pointsize=5)}
+#a little summary of new df
+summary(data_imputed)
+
+```
+
+\newpage
+
+## 2. EDA, is there anything affecting the rental prices?
+
+After imputing the data we can now explore more in detail the
+distribution of each feature to identify eventual outliers and
+irregularities. From the summary, one can immediately see that there are
+some outliers in the features - The `area`, the `hoa` (Homeowners tax),
+fire and property taxes have some very suspicious maximum, suggesting
+that some houses may be completely irrelevant for our analysis. We'll
+see by looking at a boxplot and an histogram density plot for each
+interesting numerical feature. Categorical columns don't actually reveal
+any interesting trend.
+
+```{r, echo = FALSE, tidy=TRUE, fig.width = 8, fig.height = 4, fig.align = 'center'}
+
+#boxplot and histograms with density lines for interesting numerical columns
+num_cols <- sapply(data_imputed, is.numeric)
+cat_cols <- sapply(data_imputed,is.factor)
+numcols1 <- c("area", "hoa", "rent", "proptax", "fireins")
+
+#storing the plots
+p_boxplot <- list()
+p_boxplot1 <- list()
+p_histogram <- list()
+p_histogram1 <- list()
+
+#plots
+for (col in names(data_imputed[numcols1])) {
+  #boxplot
+  p_boxplot[[col]] <- ggplot(data_imputed, aes(y = !!sym(col))) +
+    geom_boxplot(fill = "lightblue", alpha = 0.5, outlier.color = "red", outlier.shape = 1) +
+    labs(title = paste0(col," boxplot"), x = "") +
+    theme_bw()
+
+  #histogram
+  p_histogram[[col]] <- ggplot(data_imputed, aes(x = !!sym(col))) +
+    geom_histogram(fill = "lightblue", alpha = 0.5) +
+    geom_freqpoly(color = "lightblue", size = 0.05) +
+    labs(title = paste0(col," hist"), y = "", x = "") +
+    theme_bw()
+  
+  #boxplot with log scaled data
+  p_boxplot1[[col]] <- ggplot(log(data_imputed[,numcols1]), aes(y = !!sym(col))) +
+    geom_boxplot(fill = "lightblue", alpha = 0.5, outlier.color = "red", outlier.shape = 1) +
+    labs(title = paste0("log scaled Boxplot ", col), x = "") +
+    theme_bw()
+  
+  #histogram with scaled data
+  p_histogram1[[col]] <- ggplot(log(data_imputed[,numcols1]), aes(x = !!sym(col))) +
+    geom_histogram(fill = "lightblue", alpha = 0.5) +
+    geom_freqpoly(color = "lightblue", size = 0.05) +
+    labs(title = paste0("log scaled hist ", col), y = "", x = "") +
+    theme_bw() 
+
+  # all takes too much space
+  #print(plot_grid(p_boxplot, p_histogram, p_boxplot1, p_histogram1, ncol = 4))
+}
+
+#showing area and proptax to see remarkably high-skeweness
+print(plot_grid(p_boxplot$area, p_histogram$area, p_boxplot1$area, p_histogram1$area, ncol = 4))
+print(plot_grid(p_boxplot$proptax, p_histogram$proptax, p_boxplot1$proptax, p_histogram1$proptax, ncol = 4))
+
+
+```
+
+***Above, you can see just a snapshot of a significant skewed
+distributions (area).***
+
+As suspected most variables present some outliers. All the distributions
+are visibly right skewed, with most values being in the interquartile
+range and some houses with remarkably high features. Although it is true
+that we might log scale to make the distributions more "normal", that
+would underestimate the magnitude of the outliers.
+
+#### 2.1 Removing the *outliers*: some houses data just don't make sense
+
+As we have an understanding of the dataset (we carefully analyzed it
+before taking this decision), we are now ready to get rid of the
+*outliers* as they might destabilize our results and the accuracy of our
+models. Obviously, we considered only numerical variables that make
+sense; for instance, it does not make sense to delete the house on the
+300th floor (=, neither one with many rooms. In total, ***268 houses
+were disregarded***.
+
+```{r, fig.width=2, fig.height=2, dev.args=list(pointsize=5), results= FALSE}
+# Columns to consider for outlier detection
+cols <- c("area", "hoa","rent", "proptax")
+data_out <- data_imputed[, cols]
+
+#using z-scores method
+z_scores <- apply(data_out, 2, function(x) abs((x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Identify rows with at least one z-score greater than 3 (considered outliers)
+outlier_rows <- row.names(data_out)[apply(z_scores, 1, function(x) any(x > 3))]
+# Print the number of outliers detected
+cat("Number of outliers detected:", length(outlier_rows), "\n")
+
+#new df without outliers
+data3 <- data_imputed[!(rownames(data_imputed) %in% outlier_rows), ]
+
+#231 out of 268 have rent == 15000, trivially some data entry errors
+
+```
+
+```{r, echo = FALSE, fig.width = 7, fig.height = 4, fig.align = 'center'}
+#For example, we visualize the boxplots and the q-q plots of the rent distribution with and with no outliers, the difference is #striking!
+par(mfrow=c(2,2))
+options(repr.plot.width=12, repr.plot.height=6)
+boxplot(data_imputed$rent, col = "lightblue3", horizontal = T, lwd = 4,
+        main = "Rent - Before Removing Outliers")
+qqnorm(data_imputed$rent)
+
+boxplot(data3$rent, col = "palegreen3", horizontal = T, lwd = 4,
+        main = "Rent - After Removing Outliers")
+qqnorm(data3$rent)
+```
+
+#### 2.2 Thoughts on outliers, the importance of looking into them.
+
+-   For the outliers removal we decided to apply the *z-scores method*,
+    setting the threshold to 3. Interesting things came up doing so -
+    for instance most of the houses removed had the same rent price of
+    15000 - it is not difficult to notice that it may be a trivial data
+    entry error! Also, some houses were incredibly big but had the same
+    rooms of those which were way smaller. It is true that the **parking
+    spaces** area could be included in the total **`area`**, but is it
+    worth to consider these likely wrong typed data?
+
+-   By looking at the Q-Q plot it also came up that it is very unlikely
+    that some of them were actually part of the dataset, some type
+    errors might have been done given that data was crawled by rent ads
+    data. Still some extremes are present in the new data but as already
+    mentioned, it is very common to have house prices following a right
+    skewed distribution in our opinion; Most of high ended houses are
+    located in Sao Paulo, where most of the luxurious houses are at.
+    This could suggest that it may be profitable for the agency to
+    invest there.
+
+\nopagebreak
+
+#### 2.3 Our previous try, the IQR method.
+
+Before, We chose to apply the IQR method setting 1.5 as step for
+outliers in the lower quartile and a more relaxed 2 multiplier for
+extreme values - The approach with 1.5 as multiplier was too strict,
+deleting legitimate houses. The amount of deleted data was considerable
+($\approx 12$%), and it is highly unlikely that this amount of data
+contain all real outliers. Indeed, we assume that is compleletely normal
+to have very expensive and fancy houses in specific areas; once again
+most of the detected "false outliers" were located at Sao Paulo, where
+houses' rents are generally higher.
+
+## 3. Correlation among variables: Can it affect our model?
+
+We must assess the relevance of our predictors. We can check if there's
+any linear dependence among them by looking at the correlation matrix.
+
+```{r, echo = FALSE, fig.width = 8 , fig.height = 6, fig.align = 'center'}
+
+#correlation matrix with numericals
+corr_matrix <- cor(select_if(data3, is.numeric))
+
+# heatmap with fancy colors (=
+corr <- corrplot(corr_matrix, method = "color", type = "lower", order = "hclust",
+         addCoef.col = "black", tl.cex = 0.8, cl.cex = 0.8, 
+         col = colorRampPalette(c("#313695", "#4575B4", "#74ADD1", "#ABD9E9", 
+                                  "#E0F3F8", "#FFFFBF", "#FEE090", "#FDAE61", 
+                                  "#F46D43", "#D73027", "#A50026"))(200))
+
+
+```
+
+#### 3.1 Is there a risk that linear models will be affected by Multicollinearity?
+
+-   Looking at the correlation heatmap, it is easy to see why rooms,
+    area and the rent amounts are correlated - trivially, one would want
+    to spend more if there are more rooms and space in a house and
+    viceversa.
+
+-   On the other hand, it is remarkable the correlation of **`rent`**
+    with the fire insurance **`fireins`**. It could make sense that the
+    price of the insurance is correlated with the rent amount - this
+    usually works for car insurance.
+
+-   No apparent risk of multicollinearity among predictors as the only 2
+    highly correlated variables are the fire insurance and our target.
+    Houses' taxes are somehow correlated but not so much, we maybe can
+    try to do a little feature engineering to sort this out.
+    \nopagebreak
+
+#### 3.2 Fitting with one predictor - is there linearity?
+
+Since the end goal is to predict the rental prices, it would be
+interesting to see the single relationships between predictors and
+target (**`rent`**). We will show the variables having correlation
+higher than 0.4 with rent - the other coefficients are not that
+significant. The fitted regression lines below show the linear
+relationship between each chosen predictor and the target.
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 5, fig.align = 'center'}
+#feats to consider
+feat <- c("proptax", "fireins", "rooms", "area")
+target <- "rent"
+
+#fitted a simple regression with most correlated as predictors (also conf.int at 95% shown, even though not visible)
+p_list <- list() 
+for (i in 1:length(feat)) {
+  p <- ggplot(data3, aes(x = !!sym(feat[i]), y = !!sym(target))) +
+    geom_point(cex = 3, pch = 1, stroke = 2, color="palegreen3") +
+    geom_smooth(method = "lm", color = "green4", lwd = 3, formula = "y~x", se = TRUE, level = 0.95, size = 3) +
+    theme_light(base_size = 16) +
+    ggtitle(paste("Scatter plot of", feat[i], "vs", target))
+  
+  p_list[[i]] <- p
+}
+
+#showing the plots
+grid.arrange(grobs = p_list, ncol = 2) 
+
+#a closer look into fireins
+p_list[[2]]
+
+
+```
+
+\nopagebreak
+
+#### 3.3 The importance of fire insurance.
+
+Ironically, the scatterplots show that even taking the **`fireins`** as
+a single predictor could be a decent solution! (using a very simple
+linear regression, it can be seen a clear positive correlation). However
+we must investigate other relevant information that may come useful for
+our regression. Area also seems to have a positive relation with the
+rental prices as well as the property taxes. We will see if there is a
+risk of high variability in our models, since the bias should be quite
+low.
+
+#### 3.4 Categorical variables inspection
+
+What about categorical variables? is there any relation of them with the
+rent price? Let's check it out!
+
+```{r, echo = FALSE, fig.width = 10, fig.height = 6, fig.align = 'center', results='hide'}
+#boxplots for rental prices by category, in red outliers
+
+newcol <- c("furniture", "city")
+plots <- list()
+
+for (col in names(data3[newcol])) {
+  p_box <- ggplot(data3, aes(x = !!sym(col), y = rent, fill = factor(.data[[col]]))) +
+    geom_boxplot(outlier.shape = 1, outlier.size = 2, outlier.color = "red") +
+    labs(x = col, y = "Rent Amount") +
+    theme_bw()
+
+  p_hist <- ggplot(data3, aes(x = !!sym(col))) +
+    geom_bar(fill = "blue", alpha = 0.5) +
+    labs(title = "Category Frequency", y = "Frequency", x = "Category") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+  plots[[col]] <- arrangeGrob(p_box, p_hist, nrow = 2)
+}
+
+# Arrange and display the plots
+final_plot <- grid.arrange(grobs = plots, ncol = 2)
+print(final_plot)
+
+
+```
+
+```{r, include = FALSE, results = 'hide'}
+#Rent ditribution by City (including only those having rent less than 8000)
+library(RColorBrewer)
+pal <- brewer.pal(7, "Greens")
+
+#average rent by city
+mu <- data3 %>%
+  filter(rent < 2000) %>%
+  group_by(city) %>%
+  summarise(grp.mean = mean(area))
+
+options(repr.plot.width = 12, repr.plot.height = 7)
+
+data3 %>%
+  filter(rent < 8000) %>%
+  ggplot(aes(x = rent, color = city)) +
+  geom_density(lwd = 3) +
+  scale_color_manual(values = pal) +
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = city),
+             linetype = "dashed", lwd = 2) +
+  labs(title = "Rent Distributions by City", x = "Rent") +
+  theme_light(base_size = 18) +
+  theme(legend.position = "bottom")
+```
+
+#### 3.5 Furnished and Sao Paulo houses, how the rental agency might make profits.
+
+From the boxplots 3 important considerations can be taken away:
+
+-   Houses in Sao Paulo cost more than in other places as the
+    interquartile and the median show. Also, the majority of the most
+    expensive are located in this city.
+
+-   Whist animal allowance (**`animal`**) does not make a huge
+    difference in rent prices, furniture obviously does. The lower
+    quartile of the furnished home rental price corresponds to the
+    median of not furnished ones, indicating a relevant difference in
+    rental prices.
+
+-   It is interesting to see that most of the outliers we took out were
+    "not furnished" homes but they had very high prices! Maybe they were
+    really big properties like villas and entire buildings... given that
+    some floor data was missing and we imputed it.
+
+## 4. What do we really want to predict?
+
+Although the primary objective was to identify the features that would
+make the real estate more profitable, that is pretty easy to see. We
+have already seen how rents are higher in the Sao Paulo area, and
+there's a trivial positive correlation between area and rent amount. Our
+main objective is to get a comprehensive view of rental prices, pointing
+out the major differences by their features. Some questions might
+include: Is there a significant difference in prices according to each
+**`city`**? or maybe: What is the amount of money that I'm likely to
+spend on monthly rents, given that I want x **`rooms`** and y
+**`bathrooms`**?) and first and foremost, what is a fair price I should
+pay for a rent in these areas? We will see whether the assumption we are
+doing on profitability really holds true.
+
+#### 4.1 Elastic net is the right balance between Lasso and Ridge regression.
+
+The first thing to do is to select the relevant features to include in
+the model. The first method that we will use to predict the rents amount
+is *Elastic net*. *Lasso* and *Ridge regression* won't be that useful
+(we tried them), as they usually don't handle well multicollinearity (In
+the case of lasso, it just picks one of the correlated and disregard the
+other basically). On the contrary as we saw in class, *Elastic Net* can
+balance well the L1 and L2 penalties by adjusting alpha!
+
+#### 4.2 Stepwise methods, great but less robust than regularization ones.
+
+Important Disclaimer: Including **`fireins`** dramatically improves the
+model. We will show the best models and compare the performance with and
+without this variable; The positive correlation to the target is almost
+1, making it the perfect feature, however evaluating the models without
+this feature could be beneficial to confirm the general goodness of the
+models. Before let's check out how a simple linear model with AIC and
+BIC criteria perform! Since AIC and BIC perform roughly the same, we
+will show the AIC as we don't have so many predictors to prefer a more
+penalized and strict approach. The AIC provides a good way to balance
+between complexity and generalization to new data; however they are less
+reliable, since variable selection could introduce some bias towards
+specific features - for instance, it may give high importance to
+**`fireins`** (we don't need to know how important that is) and
+disregard features which are actually influential because it wants to
+reduce the risk of overfitting and model complexity.
+
+***Please Note that you can find the chunk code of the models in the
+Rscript. The chunk was very large and hence we did not include it in the
+report. Nonetheless, the 3 AIC models are listed below***:
+
+1)  AIC criterion (model with fireins and without it, back and forward
+    elimination included!) lm_aic \<- stepAIC(lm(rent \~ ., data =
+    train_data), direction = "both", trace = FALSE)
+
+2)  AIC Linear Model without **`fireins`** lm_aic2 \<- stepAIC(lm(rent
+    \~ hoa + proptax + area + rooms + city + bathroom + floor +
+    parking.spaces + furniture + animal, data = train_data), direction =
+    "both", trace = FALSE)
+
+3)  model with some feature engineering to reduce predictors (combining
+    correlated and disregarding less relevant) lm_aic3 \<-
+    stepAIC(lm(rent \~ hoa*proptax + area*rooms + city + bathroom +
+    parking.spaces + fireins + furniture, data = train_data), direction
+    = "both", trace = FALSE)
+
+```{r, echo = FALSE, fig.height= 3, fig.width= 8}
+
+#except fireins, what are the most important predictors?
+#prepping data
+set.seed(123)
+
+# Split the data into training and valid(test) sets (80-20 as usual)
+train_indices <- sample(1:nrow(data3), 0.8*nrow(data3))
+train_data <- data3[train_indices, ]
+test_data <- data3[-train_indices, ]
+
+#excluding fireins
+predictors <- setdiff(names(data3),c("fireins", "rent")) 
+train_x <- train_data[, predictors]
+train_y <- train_data$rent 
+test_x <- test_data[,predictors]
+test_y <- test_data
+
+#including fireins
+train_x2 <- train_data[, -which(names(train_data) == "rent")]
+train_y2 <- train_data$rent
+test_x2 <- test_data[, -which(names(test_data) == "rent")]
+test_y2 <- as.vector(test_data$rent)
+
+#Elastic net with cv (5 folds) including fireins
+#Elastic Net cannot have factors! (cat var in general) hence we encode them!
+train_city_encoded <- model.matrix(~ city - 1, data = train_data)
+test_city_encoded <- model.matrix(~ city - 1, data = test_data)
+
+train_animal_encoded <- model.matrix(~ animal - 1, data = train_data)
+test_animal_encoded <- model.matrix(~ animal - 1, data = test_data)
+
+train_furniture_encoded <- model.matrix(~ furniture - 1, data = train_data)
+test_furniture_encoded <- model.matrix(~ furniture - 1, data = test_data)
+
+#encoded variables with the remaining predictors
+train_x2net <- cbind(train_data[, -which(names(train_data) %in% c("rent", "city", "animal", "furniture"))], train_city_encoded, train_animal_encoded, train_furniture_encoded)
+test_x2net <- cbind(test_data[, -which(names(test_data) %in% c("rent", "city", "animal", "furniture"))], test_city_encoded, test_animal_encoded, test_furniture_encoded)
+
+#scaling is important in penalized approaches, we only scale numericals
+# numeric variables (we also include those "categoricals", they have too many levels!)
+numeric_vars1 <- c("area","rooms","bathroom","parking.spaces","floor","hoa","proptax","fireins")
+
+# Scale the numeric variables
+scaled_train_x2net <- train_x2net
+scaled_train_x2net[, numeric_vars1] <- scale(train_x2net[, numeric_vars1])
+scaled_test_x2net <- test_x2net
+scaled_test_x2net[, numeric_vars1] <- scale(test_x2net[, numeric_vars1])
+
+
+# Convert the data frames to matrix format
+train_x2net <- as.matrix(scaled_train_x2net)
+test_x2net <- as.matrix(scaled_test_x2net)
+
+
+#tuning lambda with cv (we don't prioritize L1 or L2, mixed approach is best hence alpha = 0.5)
+enet_model <- cv.glmnet(train_x2net, train_y2, alpha = 0.5, nfolds = 10)
+
+#optimal lambda value (we are less conservative and we use min)
+lambda_min <- enet_model$lambda.min
+#lambda_1se <- enet_model$lambda.1se
+#fitting
+enet_model_fit <- glmnet(train_x2net, train_y2, alpha = 0.5, lambda = lambda_min)
+
+#preds,RMSE and coefficients
+predictions_enet <- predict(enet_model_fit, newx = test_x2net)
+# rescaled_predictions_enet <- rescale(scaled_predictions_enet, original_scale)
+
+rmse_enet <- sqrt(mean((predictions_enet - test_y2)^2))
+
+
+# Function to calculate R2
+calculate_R2 <- function(y_true, y_pred) {
+  y_mean <- mean(y_true)
+  ss_total <- sum((y_true - y_mean)^2)
+  ss_residual <- sum((y_true - y_pred)^2)
+  R2 <- 1 - (ss_residual / ss_total)
+  return(R2)
+}
+
+#df to store the model performance indicators
+performance_df <- data.frame(Model = character(), RMSE = numeric(), R2 = numeric(), stringsAsFactors = FALSE)
+
+
+#appending model performance
+r2_enet <- calculate_R2(test_y2, predictions_enet)
+performance_df <- rbind(performance_df, c("Elastic Net", rmse_enet, r2_enet))
+
+
+#AIC with validation set (No need to scale data)
+
+#AIC criterion (model with fireins and without it, bac and forward elimination included!)
+lm_aic <- stepAIC(lm(rent ~ ., data = train_data), direction = "both", trace = FALSE)
+lm_aic2 <- stepAIC(lm(rent ~ hoa + proptax + area + rooms + city + bathroom + floor + parking.spaces + furniture + animal, data = train_data), direction = "both", trace = FALSE)
+
+#model with some feature engineering to reduce predictors (combining correlated)
+lm_aic3 <- stepAIC(lm(rent ~ hoa*proptax + area*rooms + city + bathroom +  parking.spaces + fireins + furniture, data = train_data), direction = "both", trace = FALSE)
+
+
+#complete model performance
+predictors1 <- setdiff(names(data3),c("rent")) 
+test3 <- test_data[,predictors1]
+predictions_aic <- predict(lm_aic, newdata = test3)
+rmse_aic <- sqrt(mean((predictions_aic - test_y2)^2))
+R2_aic <- calculate_R2(test_y2, predictions_aic)
+performance_df <- rbind(performance_df, c("Linear Model AIC complete", rmse_aic, R2_aic))
+
+#no fireins model
+predictions_aic2 <- predict(lm_aic2, newdata = test3)
+rmse_aic2 <- sqrt(mean((predictions_aic2 - test_y2)^2))
+R2_aic2 <- calculate_R2(test_y2, predictions_aic2)
+performance_df <- rbind(performance_df, c("Linear Model AIC2", rmse_aic2, R2_aic2))
+
+#model with no animal and new engineered features
+predictions_aic3 <- predict(lm_aic3, newdata = test3)
+rmse_aic3 <- sqrt(mean((predictions_aic3 - test_y2)^2))
+R2_aic3 <- calculate_R2(test_y2, predictions_aic3)
+performance_df <- rbind(performance_df, c("Linear Model AIC3", rmse_aic3, R2_aic3))
+
+
+# Summary of the 4 models
+#summary(lm_aic)
+#summary(lm_aic2)
+#summary(lm_aic3)
+#elastic net coefficients
+#coef(enet_model_fit)
+
+
+#are residuals normally distributed?
+
+# Best performing Model lm_aic
+residuals_aic3 <- residuals(lm_aic3)
+#hist
+hist(residuals_aic3, breaks = 20, main = "Residuals - Model lm_aic feature engineering", xlab = "Residuals")
+
+#Model lm_aic2
+#residuals_aic2 <- residuals(lm_aic2)
+#hist(residuals_aic2, breaks = 20, main = "Residuals - Model lm_aic ", xlab = "Residuals")
+
+
+#showing the performances of the models
+colnames(performance_df) <- c("Model", "RMSE", "R-Squared")
+performance_df
+
+```
+
+#### 4.3 The importance of feature engineering.
+
+It is interesting to see the results:
+
+-   The best performing model (AIC with featured engineering), which
+    obviously includes **`fireins`** had explained almost 99% of the
+    variability (R\^2), its residuals distribution was not perfectly
+    normal but a little right-skewed. This can be due to the fact that
+    some non-linear relationship may be present between predictors
+    (especially those having modest correlation) and our target. If we
+    take a closer look at the fitted line with **`fireins`** as only
+    predictor, we can clearly see some anomalies for low values of
+    **`fireins`** (underestimated rents) that may be identified by more
+    complex models; it is likely that this model highly relied on
+    **`fireins`** and hence underestimated some rents.
+
+-   The model without **`fireins`** has performed quite poorly in
+    comparison with the other 2. It is though visible that the model has
+    no bias in its predictions (by looking at the distributions of
+    residuals) but cannot understand the complexity of our data.
+
+-   The featured engineering has helped and shown how the animal feature
+    and parking spaces were little helpful - they had low
+    coefficients/completely removed both in elastic net and AIC first
+    models. The combination of the correlated features might have
+    reduced very little noise, contributing to a slightly lower RMSE and
+    higher R-Squared. Some cities were also considered useless in
+    affecting the price, though some had quite high coefficients,
+    meaning that they have negative/positive correlation with the
+    target! Also, rooms coefficients suggested a low impact on the
+    target, reasonably because area had an higher influence.
+
+-   In all the models the **`area`** and the **`city`** play an
+    important role: houses in Porto Alegre are generally deemed to have
+    negative coefficients (negative correlation with rent, that is, the
+    expected rent in Porto alegre is lower), suggesting as we have seen
+    with the EDA, that it may be a good deal to rent a house there. From
+    the Real Estate agency perspective instead, furnished homes and
+    houses in Sao Paulo have a positive correlation with the rent
+    prices, but this was expected. It is curious to see that a unit
+    increase of area decreases the rent price in the some models, but
+    why? Simple, on average we discovered that houses are way larger in
+    Porto Alegre and Campinas, which have a negative correlation with
+    prices, outweighing the effect of large houses in crowded cities
+    like Rio and Sao Paulo that have on average smaller houses and
+    higher rents. \nopagebreak
+
+## 5. Fancier methods: Random Forest and GAM Splines
+
+As linear models work pretty well, we nonetheless think that some
+non-linear relationship can be captured. We tried numerous models, but
+these 2 work really well especially for these reasons: \nopagebreak
+
+#### 5.1 Random forest, "handles it all".
+
+-   Random Forest solves most of the issues of other decision trees
+    methods. By bagging, it trains the decision trees with random
+    sampled data, avoiding correlation in predictions (this would
+    increase variability, as the model would not be flexible and fail to
+    fit well with new data!). As we did a gridsearch, the algorithm
+    showed very similar RMSE with different tuning parameters, proving
+    its robustness. Eventually we have chosen to have 500 trees and mtry
+    set to 4 to reduce the risk of overfitting (the more trees, the less
+    weight to each tree prediction, hence less dependence on a single
+    one! - On the other hand, the less mtry, the less number of random
+    predictors in each tree, reducing the complexity of the model). The
+    bias was also very low as testified by the validation set RMSE and
+    R-squared. \nopagebreak
+
+#### 5.2 Generalized additive models caught non-linearity trends.
+
+-   On the other hand, GAMs are good for this situation since they
+    should detect the non-linear relationships we mentioned before
+    through splines, special functions that can detect non-linear
+    relationships and introduce smooth curves that fit the data.
+
+***Please Note that you can find the chunk code of the models in the
+Rscript. The chunk was very large and hence we did not include it in the
+report. A thorough description of the models is available on the
+Rmarkdown.***
+
+\nopagebreak
+
+```{r, echo = FALSE, fig.height= 3, fig.width = 6, fig.align="center"}
+#Random forest
+# increasing mtry to equal all the predictor variables is bagging
+
+m.randomForest.bag <- randomForest(x = train_x2, y = train_y2,
+                                   ntrees = 500,
+                                   mtry = 4);
+#predictions and measures
+predictionsrfbag <- predict(m.randomForest.bag, newdata = test3)
+rmserfbag <- sqrt(mean((predictionsrfbag - test_data$rent)^2))
+r_squaredrf <- cor(predictionsrfbag, test_data$rent)^2
+performance_df <- rbind(performance_df, c("Random forest Complete", rmserfbag, r_squaredrf))
+
+
+#random forest without fireins
+m.randomForest.bag2 <- randomForest(x = train_x, y = train_y,
+                                   ntrees = 500,
+                                   mtry = 4);
+
+predictionsrfbag2 <- predict(m.randomForest.bag2, newdata = test3)
+rmserfbag2 <- sqrt(mean((predictionsrfbag2 - test_data$rent)^2))
+r_squaredrf2 <- cor(predictionsrfbag2, test_data$rent)^2
+performance_df <- rbind(performance_df, c("Random forest no fireins", rmserfbag2, r_squaredrf2))
+
+
+
+#splines functions applied to variables less correlated with target(likely non-linear relationships!))
+m.gam.spline <- gam(rent ~ s(hoa) + s(proptax) + area + rooms + city + bathroom + floor + parking.spaces + fireins + furniture, data = train_data)
+#summary(m.gam.spline)
+
+predictionsgam <- predict(m.gam.spline, newdata = test3)
+rmserfgam <- sqrt(mean((predictionsgam - test_data$rent)^2))
+r_squaredgam <- cor(predictionsgam, test_data$rent)^2
+
+performance_df <- rbind(performance_df, c("Gam1", rmserfgam, r_squaredgam))
+
+
+
+#second model aims at mitigating correlation among predictors!
+m.gam.spline1 <- gam(rent ~ s(hoa * proptax) + s(area * rooms) + city + bathroom + floor + parking.spaces + s(fireins) + furniture, data = train_data)
+#summary(m.gam.spline1)
+
+predictionsgam1 <- predict(m.gam.spline1, newdata = test3)
+rmserfgam1 <- sqrt(mean((predictionsgam1 - test_data$rent)^2))
+r_squaredgam1 <- cor(predictionsgam1, test_data$rent)^2
+performance_df <- rbind(performance_df, c("Gam with feature engineering", rmserfgam1, r_squaredgam1))
+
+
+performance_df
+
+
+```
+
+#### 5.3 Validation set results.
+
+Looking at the dataframe, there's little doubt which method to choose.
+Not only random forest is the best choice in terms of model perfomance
+indicators, but it also is surely the most flexible - we also had a
+significant improvement without the fireins feature, meaning that the
+model was able to explain further variability.
+
+\nopagebreak
+
+#### 5.4 The variance-bias trade off, a personalized "bootstrapping".
+
+On the one hand, the ability to adapt to different kind of houses is
+crucial for the real estate agency and also for potential families which
+want to invest money wisely. On the other, our results must be as
+accurate as possible. We chose to use a "personalized" bootstrapping to
+assess the model performance. We are basically taking 10 sampled
+training and test sets and allowing replacement, unlike cross-validation
+which does not train and test on already seen data (folds), we are
+basically sampling 80% of the data for training and 20 as validation set
+for 10 iterations. To enhance computational efficiency and capture
+enough variability, we chose to sample 30% of the dataset and then split
+80-20; Not only is the size that provides most reliable and stable
+estimates (we tried sampling 50%, 63% and 80%) but also perfectly
+depicts the concept of the **bias-variance tradeoff**.
+
+***Please Note that you can find the chunk code of the models in the
+Rscript. The chunk was very large and hence we did not include it in the
+report.***
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 4, fig.align = 'center'}
+
+#WE USED A SMALL PORTION OF THE DATA TO DO BOOTSTRAPPING. TAKING THE WHOLE DATASET EXACTLY
+#SHOWED THE SAME PERFORMANCES. THERE IS NO RISK TO EXCLUDE SOME IMPORTANT VALUES, AS 10 ITERATIONS SHOULD ENSURE ENOUGH VARIABILITY IN SAMPLES.
+#TAKES LONG BUT IT IS A RELIABLE WAY TO ESTIMATE GENERAL MODELS' PERFORMANCE
+
+#lists to store performance results
+plot1 <- list()
+plot2 <- list()
+plot3 <- list()
+
+
+# Bootstrapping for each model and compute RMSE and R^2 (not shown but still important)
+num_iterations <- 10  
+set.seed(123)  
+for (i in 1:num_iterations) {
+  # Split data into train and test sets (TAKING 30% sample data and splitting 80-20)
+  train_datasample <- data3[sample(nrow(data3), size = round(0.3 * nrow(data3))), ]
+  train_indices <- sample(nrow(train_datasample), size = floor(0.8 * nrow(train_datasample)), replace = FALSE)
+  train_setcv <- train_datasample[train_indices, ]
+  test_setcv <- train_datasample[-train_indices, ]
+  
+  traincv <- train_setcv[,-which(names(train_datasample) == "rent")]
+  test_cv <- test_setcv[,-which(names(train_datasample) == "rent")]
+  testy_cv <- test_setcv$rent
+  
+  # Random Forest with bagging
+  m.randomForest.bagcv <- randomForest(x = traincv, y = train_setcv$rent,
+                                     ntrees = 500,
+                                     mtry = 4)
+  
+  predictionsrfbagcv <- predict(m.randomForest.bagcv, newdata = test_cv)
+  rmserfbagcv <- 0
+  r_squaredrfcv <- 0
+  rmserfbagcv <-   sqrt(mean((predictionsrfbagcv - testy_cv)^2))
+  r_squaredrfcv <- cor(predictionsrfbagcv, testy_cv)^2
+  plot1[i] <- rmserfbagcv
+  
+  #Best AIC
+  lm_aic3cv <- stepAIC(lm(rent ~ hoa*proptax + area*rooms + city + bathroom +  parking.spaces + fireins + furniture, data = train_setcv), direction = "both", trace = FALSE)
+  predictions_aic3cv <- predict(lm_aic3cv, newdata = test_cv)
+  rmse_aic3cv <- 0
+  R2_aic3cv <- 0
+  rmse_aic3cv <- sqrt(mean((predictions_aic3cv - testy_cv)^2))
+  R2_aic3cv <- calculate_R2(testy_cv, predictions_aic3cv)
+  plot2[i] <- rmse_aic3cv
+
+  
+  # GAM with interaction terms
+  m.gam.spline1cv <- gam(rent ~ s(hoa * proptax) + s(area * rooms) + city + bathroom + floor + parking.spaces + s(fireins) + furniture, data = train_setcv)
+  predictionsgam1 <- predict(m.gam.spline1cv, newdata = test_cv)
+  rmserfgam1cv <- 0
+  r_squaredgam1cv <- 0
+  rmserfgam1cv <- sqrt(mean((predictionsgam1 - testy_cv)^2))
+  r_squaredgam1cv <- cor(predictionsgam1, testy_cv)^2
+  plot3[i] <- rmserfgam1cv
+
+}
+```
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 4, fig.align = 'center'}
+# Plotting the variation of RMSE for each model
+#lists to vector to compute CI
+plot1 <- unlist(plot1)
+plot2 <- unlist(plot2)
+plot3 <- unlist(plot3)
+
+# Calculate mean and standard deviation of predictions for each model
+mean_plot1 <- mean(plot1)
+sd_plot1 <- sd(plot1)
+
+mean_plot2 <- mean(plot2)
+sd_plot2 <- sd(plot2)
+
+mean_plot3 <- mean(plot3)
+sd_plot3 <- sd(plot3)
+
+# Calculate confidence intervals (95%)
+ci_plot1 <- quantile(plot1, probs = c(0.025, 0.975))
+ci_plot2 <- quantile(plot2, probs = c(0.025, 0.975))
+ci_plot3 <- quantile(plot3, probs = c(0.025, 0.975))
+
+# Plot mean predictions with confidence intervals
+plot_data <- data.frame(
+  Model = c("Random Forest", "AIC Linear Model", "GAM spline"),
+  Mean = c(mean_plot1, mean_plot2, mean_plot3),
+  Lower_CI = c(ci_plot1[1], ci_plot2[1], ci_plot3[1]),
+  Upper_CI = c(ci_plot1[2], ci_plot2[2], ci_plot3[2])
+)
+
+# plot
+p <- ggplot(plot_data, aes(x = Model, y = Mean)) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.2, color = "blue") +
+  geom_point(color = "blue") +
+  xlab("Model") +
+  ylab("Predictions") +
+  ggtitle("Average RMSE with Confidence Intervals")
+
+print(p)
+
+
+
+```
+
+#### 5.5 Regression conclusions.
+
+-   Our bootstrapping estimates confirms our initial belief, Random
+    forest strikes **bias-variance** **tradeoff**. Even though GAM has
+    lower average RMSE (and hence, less expected bias), the Confidence
+    interval is larger, indicating that the model has higher variability
+    and a little bias to underestimate rentals (We can notice looking at
+    the upper CI). On the other hand, Random forest has no systematic
+    bias as the confidence interval and its estimates are perfectly
+    normally distributed, with both the upper and lower CI being roughly
+    the same! The secret? Random forest is a bagging method, hence
+    reduces overfitting and gerenalizes better! In this instance, the
+    RMSE estimation is important but does not tell all - our random
+    forest model is tuned with very conservative hyperparameters and
+    increasing the amount of training data (as we did with the
+    validation set results) shows the goodness of the model.
+
+-   Another interpretation of the confidence interval is the following:
+    With CI we are estimating error that the models have. What if we
+    could assume that CI could be interpreted as a threshold for good
+    deals for the real estate agency and for affordable houses? Imagine
+    one wants to be 95% sure that the home to rent has a fair price;
+    he/she can look at the predictions of similar homes and estimates of
+    the models error - the one can check whether the difference **rental
+    offered - predicted rental** lies in the estimated error interval,
+    that is, for the predicted rental price based on the same brazilian
+    house market segment, is the price in line with those of similar
+    homes?
+
+## 6. Clustering: Can we identify the most profitable and convenient houses?
+
+As we said, there are certain factors that make an house more
+profitable, first and foremost its location and area; the initial idea
+though was to get a comprehensive idea of the rental market and identify
+also the most convenient ones! Clustering will help us identify diverse
+rental groups, giving advice of where, how spacious an house should be
+to save some money. We will start by implementing **kmeans**, using the
+elbow method and silhouette score to assess the right number of clusters
+k.
+
+***Below, Within sum of squares shown by the elbow method.***
+
+```{r, echo = FALSE, fig.width = 7, fig.height = 3, fig.align = 'center'}
+#wss
+#scaled data (numeric only)
+data_scaled <- scale(data3[,numeric_vars1])
+data_scaled <- as.data.frame(data_scaled)
+
+#elbow method
+k_values <- 1:15  # Range of k values to consider
+withinss <- numeric(length(k_values))
+
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  kmeans_result <- kmeans(data_scaled, centers = k)
+  withinss[i] <- kmeans_result$tot.withinss
+}
+
+# Plot the elbow curve
+elb <- plot(k_values, withinss, type = "b", pch = 19, frame = FALSE,
+        xlab = "Number of Clusters (k)", ylab = "Within-cluster Sum of Squares")
+
+
+#silhouette score by k
+#silk <- fviz_nbclust(data_scaled, kmeans, method='silhouette')
+#grid.arrange(elb, silk, ncol = 1)
+print(elb)
+
+
+```
+
+\nopagebreak
+
+#### 6.1 The best k for Kmeans.
+
+It is evident that both the **elbow method** and the **silhouette
+scores** suggest that the right number of clusters is k = 2. Indeed the
+silhouette score by k measures the quality of clustering, the higher it
+is, the better, as it indicates that they are more distinguishable and
+separate. On the other hand the within sum of squares indicated in the
+elbow plot indicates roughly "how close" data points are in the cluster,
+that is, how segregated they are (the higher, the better, stronger
+community).
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 3, fig.align = 'center'}
+#2 clusters plot
+
+kmeans_model <- kmeans(data_scaled, centers = 2, nstart = 25)
+clus2 <- fviz_cluster(kmeans_model, data = data_scaled, geom = "point",
+             main = paste("K-Means Clustering (k =", 2, ")"))
+
+#3 clusters plot
+kmeans_model2 <- kmeans(data_scaled, centers = 3, nstart = 25)
+clus3 <- fviz_cluster(kmeans_model2, data = data_scaled, geom = "point",
+             main = paste("K-Means Clustering (k =", 3, ")"))
+
+#3 clusters plot
+grid.arrange(clus2, clus3, ncol = 2)
+
+
+
+```
+
+#### 6.2 Hierarchical clustering.
+
+Now let's get into **hierarchical clustering**! We want to effectively
+compare which method works best to identify the distinct home groups. We
+compared the euclidean and row correlation but the first behaves better
+overall, delineating clearer and more defined clusters. ***Note that the
+dendogram plot is not included - in the section below We will describe
+what it looks like.***
+
+```{r, echo = FALSE}
+
+#euclidean distance works best
+dist_euc <- dist(data_scaled, method = "euclidean")
+hc_euclidean <- hclust(dist_euc, method = "ward.D2")
+
+#dendogram (2 or 3 ideal)
+#plot(hc_euclidean, cex = 0.6, main = "Dendrogram (Euclidean distance)")
+
+#assessing the results for different k
+silhouette_euclidean <- rep(0, 3)
+for (k in 2:4) {
+  
+  # Compute cluster assignments for euclidean distance
+  hc_euclidean_k <- cutree(hc_euclidean, k = k)
+  
+  # Compute silhouette score for euclidean distance
+  sileucscores <- data.frame(silhouette(hc_euclidean_k, dist_euc))
+  mean_sil_width <- mean(as.numeric(sileucscores$sil_width))         
+  silhouette_euclidean[k - 1] <-  mean_sil_width
+  
+}
+cat("Silhouette scores for euclidean distance:", silhouette_euclidean, "\n")
+
+
+```
+
+#### 6.3 Dendogram insights.
+
+How do visualized clusters change according to their number k? For
+hierarchical clustering k = 2 and k = 3 look again the best parameters -
+apparently the algorithm finds 2 very distant clusters with k = 2, and 2
+closer groups (presumably middle and low income houses) with a separate
+group (more expensive houses) when we cut the three for 3 clusters.
+Below, we will a have a look at what the clusters look like.
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 4, fig.align = 'center'}
+# Iterate over different values of k (k = 2 and k = 3)
+plot_list3 <- list()  # initialize list for euclidean distance plots
+
+for (k in 2:3) {
+  
+  # Compute cluster assignments for euclidean distance
+  hc_euclidean_k <- cutree(hc_euclidean, k = k)
+  
+  # Plot clusters for euclidean distance
+  plot_title <- paste0("Hierarchical Clusters (Euclidean distance) for k =", k)
+  plot_title <- gsub(" ", "_", plot_title)
+  plot_list3[[k-1]] <- fviz_cluster(list(data = data_scaled, cluster = hc_euclidean_k), 
+                                     geom = "point", 
+                                     palette = "jco", 
+                                     main = plot_title) + theme_bw()
+  
+}
+
+grid.arrange(grobs = plot_list3, nrow = 1, ncol = 2, top = "Clusters (Euclidean #distance)") 
+
+
+```
+
+#### 6.4 Kmeans performs better both for silhouette and visual representation.
+
+Having compared **hierarchical** and **Kmeans** methods, the results are
+pretty clear. Although the first made a good job, **Kmeans** behaves
+better as clusters are more separate and segregated (both visually and
+in terms of silhouettes scores).
+
+## 7. Do these clusters really tell what we want?
+
+Our aim was to detect more profitable and more convenient houses in
+general - has **kmeans** detected different houses profiles? For
+responding to this, we clustered using both K = 2 and k = 3 number of
+clusters to look into them. We focused the investigation on prices and
+**`area`** as well as the **`furniture`** and the **`city`**. The 2 just
+mentioned were the most influential feature that changed the rental
+price; features like **`floor`**, **`animal`** and **`parking spaces`**
+don't really tell us much. To answer our questions we used k = 3 - in
+general houses are divided into 3 categories, small/low income ones, mid
+income, and luxury ones. It is important to understand that silhouette
+score and the elbow method are not enough to choose the correct k,
+because the context and the analysis objective come first. In this way,
+we carefully analyzed the cluster 1 (average houses) and cluster 3 (more
+expensive ones), as our objective is to catch the best deal for the
+average person and identify the homes to rent that yield the highest
+profit.
+
+```{r, echo = FALSE, fig.width = 8, fig.height = 5, fig.align = 'center'}
+data_new <- data3
+#3 clusters
+kmeans_result3 <- kmeans(data_scaled, centers = 3, nstart = 25)
+data_new$clusters3 <- kmeans_result3$cluster
+#2 clusters
+kmeans_result2 <- kmeans(data_scaled, centers = 2, nstart = 25)
+data_new$clusters2 <- kmeans_result2$cluster
+
+
+#Do clusters regroup well? What are prices by city and area?
+
+# Create the boxplot for city with regrouped clusters2
+box1 <- ggplot(data_new, aes(x = interaction(clusters3, city), y = rent)) +
+          geom_boxplot(fill = "lightgray", color = "black") +
+          labs(x = "clusters2", y = "Rent") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle("Rental prices by city and cluster")
+
+#by area
+box2 <- ggplot(data_new, aes(x = interaction(clusters3, city), y = area)) +
+          geom_boxplot(fill = "lightgray", color = "black") +
+          labs(x = "clusters2", y = "area") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle("Houses' area by cluster and city")
+
+
+#by furniture?
+
+box3 <- ggplot(data_new, aes(x = interaction(clusters3, furniture), y = rent)) +
+          geom_boxplot(fill = "lightgray", color = "black") +
+          labs(x = "clusters2", y = "rent") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle("Houses' rent by cluster (furnished or not)")
+
+box4 <- ggplot(data_new, aes(x = interaction(clusters3, furniture), y = area)) +
+          geom_boxplot(fill = "lightgray", color = "black") +
+          labs(x = "clusters2", y = "area") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle("Houses' area by cluster (furnished or not)")
+
+
+
+grid.arrange(box1, box2, box3, box4, ncol = 2)
+
+
+```
+
+\nopagebreak
+
+#### 7.1 Final considerations: What to do for the agency and people looking for a fair rent price?
+
+Looking at the 3 clusters boxplots, the results are even clearer than
+before. **From the real estate perspective it is clear that:**
+
+-   Kmeans has differentiated houses by area and rent price. Although
+    some outliers are visible in the clusters, it is easy to see that
+    the most profitable houses (given same area) are those in Sao Paulo
+    and Rio de Janeiro. Small houses belonging to cluster 1 in
+    particular are very overpriced when compared to other cities,
+    suggesting that these may yield higher profits. If we value count
+    the cluster cities, we notice that most of them are in Sao Paulo.
+    Though, the cluster 3 which contains the most expensive and largest
+    houses has predominantly houses in the city, with a stunning 78% of
+    them; the other clusters are much more balanced, suggesting once
+    again that Sao Paulo is the city to invest in for the real estate
+    agency.
+-   Also, it is worth investing in furnished houses - Their area is
+    comparable to not furnished ones and the difference in rental prices
+    is negligible - buying non furnished homes to rent may not be a good
+    deal for the agency, given that they need to furnish them to rent to
+    clients (especially for most expensive ones).
+
+**From the people looking for rents instead:** \nopagebreak
+
+-   Houses in Campinas are much more worth the money. Although they may
+    not be as appealing as the more luxurious and fancier in Sao Paulo,
+    the cluster 1 revealed that mid class houses in Campinas are on
+    average bigger and cheaper. Also, the median price for furnished
+    mid-class homes is insignificantly higher than not furnished ones,
+    so it may be worth renting them, with the median area being also
+    very similar.
